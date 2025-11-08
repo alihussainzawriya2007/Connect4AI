@@ -126,76 +126,160 @@ def is_terminal_node(board: np.ndarray) -> bool:
 def evaluate_window(window: List[int], piece: int) -> int:
     score = 0
     opp = PLAYER_PIECE if piece == AI_PIECE else AI_PIECE
-    if window.count(piece) == 4: score += 100
-    elif window.count(piece) == 3 and window.count(EMPTY) == 1: score += 5
-    elif window.count(piece) == 2 and window.count(EMPTY) == 2: score += 2
-    if window.count(opp) == 3 and window.count(EMPTY) == 1: score -= 4
+    if window.count(piece) == 4:
+        score += 100
+    elif window.count(piece) == 3 and window.count(EMPTY) == 1:
+        score += 7           # a bit stronger than before
+    elif window.count(piece) == 2 and window.count(EMPTY) == 2:
+        score += 2
+    # punish letting opponent make a 3
+    if window.count(opp) == 3 and window.count(EMPTY) == 1:
+        score -= 8           # stronger block incentive
     return score
 
 def score_position(board: np.ndarray, piece: int) -> int:
     score = 0
+    # center control: weight center column a bit more
     center_array = [int(i) for i in list(board[:, COLUMN_COUNT // 2])]
-    score += center_array.count(piece) * 3
+    score += center_array.count(piece) * 4
+
+    # rows
     for r in range(ROW_COUNT):
         row_array = [int(i) for i in list(board[r, :])]
         for c in range(COLUMN_COUNT - 3):
             score += evaluate_window(row_array[c:c+WINDOW_LENGTH], piece)
+
+    # cols
     for c in range(COLUMN_COUNT):
         col_array = [int(i) for i in list(board[:, c])]
         for r in range(ROW_COUNT - 3):
             score += evaluate_window(col_array[r:r+WINDOW_LENGTH], piece)
+
+    # positive diagonals
     for r in range(ROW_COUNT - 3):
         for c in range(COLUMN_COUNT - 3):
             score += evaluate_window([int(board[r+i, c+i]) for i in range(WINDOW_LENGTH)], piece)
+
+    # negative diagonals
     for r in range(ROW_COUNT - 3):
         for c in range(COLUMN_COUNT - 3):
             score += evaluate_window([int(board[r+3-i, c+i]) for i in range(WINDOW_LENGTH)], piece)
     return score
 
 # --------------------------
-# Minimax (with ordering)
+# AI helpers: tactics + ordering + safety
 # --------------------------
-def ordered_valid_locations(board: np.ndarray) -> List[int]:
-    order = [3,2,4,1,5,0,6]
-    return [c for c in order if is_valid_location(board, c)]
+def simulate_drop(board: np.ndarray, col: int, piece: int):
+    """Return (row, board_copy) after dropping piece; or (None, None) if invalid."""
+    if not is_valid_location(board, col):
+        return None, None
+    row = get_next_open_row(board, col)
+    if row is None:
+        return None, None
+    b_copy = board.copy()
+    drop_piece(b_copy, row, col, piece)
+    return row, b_copy
 
+def immediate_wins(board: np.ndarray, piece: int) -> List[int]:
+    wins = []
+    for col in get_valid_locations(board):
+        row, b2 = simulate_drop(board, col, piece)
+        if b2 is not None and winning_move(b2, piece):
+            wins.append(col)
+    return wins
+
+def is_unsafe_for_ai(board: np.ndarray, col: int) -> bool:
+    """True if after AI plays at col, the player gets an immediate winning reply."""
+    row, b2 = simulate_drop(board, col, AI_PIECE)
+    if b2 is None:
+        return True
+    # if AI already wins, it's fine (not unsafe)
+    if winning_move(b2, AI_PIECE):
+        return False
+    # can player win next move?
+    return any(winning_move(simulate_drop(b2, oc, PLAYER_PIECE)[1], PLAYER_PIECE)
+               for oc in get_valid_locations(b2))
+
+def order_moves(board: np.ndarray, maximizing: bool) -> List[int]:
+    """Sort moves by heuristic lookahead + center preference for strong pruning."""
+    valid = get_valid_locations(board)
+    center = COLUMN_COUNT // 2
+    scored = []
+    if maximizing:
+        for col in valid:
+            _, b2 = simulate_drop(board, col, AI_PIECE)
+            if b2 is None: 
+                continue
+            s = score_position(b2, AI_PIECE)
+            # small center bias
+            s += (3 - abs(col - center))
+            scored.append((s, col))
+        scored.sort(reverse=True)  # best first
+    else:
+        # minimizing: prefer moves that are worst for AI (best for player)
+        for col in valid:
+            _, b2 = simulate_drop(board, col, PLAYER_PIECE)
+            if b2 is None: 
+                continue
+            s = score_position(b2, AI_PIECE)
+            s += (3 - abs(col - center))
+            scored.append((s, col))
+        scored.sort()  # worst for AI first
+    return [c for _, c in scored]
+
+# Transposition table (simple exact caching)
+TRANSPOS: dict = {}
+
+# --------------------------
+# Minimax (with improved ordering + cache)
+# --------------------------
 def minimax(board: np.ndarray, depth: int, alpha: float, beta: float, maximizing: bool) -> Tuple[Optional[int], int]:
-    valid_locations = ordered_valid_locations(board)
+    key = (board.tobytes(), depth, maximizing)
+    if key in TRANSPOS:
+        return TRANSPOS[key]
+
     terminal = is_terminal_node(board)
     if depth == 0 or terminal:
         if terminal:
-            if winning_move(board, AI_PIECE):      return None, WIN_SCORE
-            elif winning_move(board, PLAYER_PIECE):return None, LOSE_SCORE
-            else:                                   return None, DRAW_SCORE
-        return None, score_position(board, AI_PIECE)
+            if winning_move(board, AI_PIECE):       val = WIN_SCORE
+            elif winning_move(board, PLAYER_PIECE): val = LOSE_SCORE
+            else:                                    val = DRAW_SCORE
+            TRANSPOS[key] = (None, val)
+            return TRANSPOS[key]
+        val = score_position(board, AI_PIECE)
+        TRANSPOS[key] = (None, val)
+        return TRANSPOS[key]
 
-    best_col = valid_locations[0] if valid_locations else None
+    best_col = None
     if maximizing:
         value = -math.inf
-        for col in valid_locations:
-            row = get_next_open_row(board, col)
-            if row is None: continue
-            b_copy = board.copy()
-            drop_piece(b_copy, row, col, AI_PIECE)
-            _, new_score = minimax(b_copy, depth-1, alpha, beta, False)
+        for col in order_moves(board, True):
+            row, b2 = simulate_drop(board, col, AI_PIECE)
+            if b2 is None: 
+                continue
+            _, new_score = minimax(b2, depth-1, alpha, beta, False)
             if new_score > value:
                 value, best_col = new_score, col
             alpha = max(alpha, value)
-            if alpha >= beta: break
-        return best_col, int(value)
+            if alpha >= beta:
+                break
+        result = (best_col, int(value))
     else:
         value = math.inf
-        for col in valid_locations:
-            row = get_next_open_row(board, col)
-            if row is None: continue
-            b_copy = board.copy()
-            drop_piece(b_copy, row, col, PLAYER_PIECE)
-            _, new_score = minimax(b_copy, depth-1, alpha, beta, True)
+        for col in order_moves(board, False):
+            row, b2 = simulate_drop(board, col, PLAYER_PIECE)
+            if b2 is None: 
+                continue
+            _, new_score = minimax(b2, depth-1, alpha, beta, True)
             if new_score < value:
                 value, best_col = new_score, col
             beta = min(beta, value)
-            if alpha >= beta: break
-        return best_col, int(value)
+            if alpha >= beta:
+                break
+        result = (best_col, int(value))
+
+    TRANSPOS[key] = result
+    return result
 
 # --------------------------
 # Drawing helpers (centers, slider, glow, controls)
@@ -248,7 +332,7 @@ def draw_slider(surface: pygame.Surface, ai_depth: int, active: bool = True):
     pygame.draw.rect(surface, (60,60,60) if active else (40,40,40), track, border_radius=4)
     fill = pygame.Rect(track.left, track.top, max(0, hx - track.left), track.height)
     pygame.draw.rect(surface, (200,200,200) if active else (90,90,90), fill, border_radius=4)
-    # handle
+    # handle (fixed signatures)
     handle_col = WHITE if active else GREY
     if HAS_GFX:
         gfx.filled_circle(surface, hx, hy, hr, handle_col)
@@ -447,7 +531,7 @@ def main() -> None:
     turn = (AI if (mode == "PvE" and first == "AI") else PLAYER)
     game_over = False
 
-    # --- FIX: initialize hover to actual mouse x so first click works even without moving ---
+    # initialize hover to actual mouse x so first click works even without moving
     hover_x = pygame.mouse.get_pos()[0]
 
     draw_board(screen, board, last_user, last_bot,
@@ -465,7 +549,9 @@ def main() -> None:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     pygame.quit(); sys.exit()
                 if event.key == pygame.K_r:
+                    # reset everything, also clear TT to avoid stale caches
                     board[:] = 0
+                    TRANSPOS.clear()
                     last_user = last_bot = None
                     game_over = False
                     turn = (AI if (mode == "PvE" and first == "AI") else PLAYER)
@@ -480,17 +566,13 @@ def main() -> None:
                     # Buttons
                     mode_rect, first_rect = get_control_rects()
                     if mode_rect.collidepoint(mx, my):
-                        # Toggle mode
                         mode = "PvP" if mode == "PvE" else "PvE"
-                        # Reset game with new mode
                         board[:] = 0
+                        TRANSPOS.clear()
                         last_user = last_bot = None
                         game_over = False
-                        if mode == "PvE":
-                            # keep 'first' as-is; decide who starts
-                            turn = (AI if first == "AI" else PLAYER)
-                        else:
-                            # PvP: red always first
+                        turn = (AI if (mode == "PvE" and first == "AI") else PLAYER)
+                        if mode == "PvP":
                             turn = PLAYER
                         draw_board(screen, board, last_user, last_bot,
                                    "New game! Your turn" if turn == PLAYER else ("AI thinking…" if mode == "PvE" else "Yellow's turn"),
@@ -498,8 +580,8 @@ def main() -> None:
                         continue
                     if first_rect.collidepoint(mx, my) and mode == "PvE":
                         first = "AI" if first == "Human" else "Human"
-                        # Restart to apply who starts
                         board[:] = 0
+                        TRANSPOS.clear()
                         last_user = last_bot = None
                         game_over = False
                         turn = (AI if first == "AI" else PLAYER)
@@ -513,6 +595,7 @@ def main() -> None:
                     if mode == "PvE" and (track.inflate(20, 16).collidepoint(mx, my) or (mx - hx)*2 + (my - hy)2 <= (hr+6)*2):
                         slider_drag = True
                         ai_depth = x_to_depth(mx, track)
+                        TRANSPOS.clear()  # new depth -> clear cache
                         draw_board(screen, board, last_user, last_bot, "Depth changed", ai_depth, mode, first)
                         continue  # don't treat as board click
 
@@ -548,7 +631,6 @@ def main() -> None:
                 if my < TOPBAR_H:
                     continue  # click on top bar
 
-                # --- FIX: choose column from the actual click X (not hover_x) ---
                 col = mx // SQUARESIZE
 
                 if not is_valid_location(board, col):
@@ -580,7 +662,7 @@ def main() -> None:
                 if winning_move(board, piece_code):
                     if mode == "PvE":
                         if turn == PLAYER:
-                            show_message(screen, "You win!", ai_depth, mode, first)
+                            show_message(screen, "You win! 🎉", ai_depth, mode, first)
                             save_game_result(board, "Player (RED) wins vs AI")
                         else:
                             show_message(screen, "AI wins!", ai_depth, mode, first)
@@ -601,12 +683,10 @@ def main() -> None:
 
                 # Next turn
                 if mode == "PvE":
-                    # human -> AI
                     if turn == PLAYER:
                         turn = AI
                         show_message(screen, "AI thinking…", ai_depth, mode, first)
                     else:
-                        # shouldn't happen; AI handled below
                         turn = PLAYER
                         show_message(screen, "Your turn", ai_depth, mode, first)
                 else:
@@ -615,15 +695,42 @@ def main() -> None:
                     who = "Red's turn" if turn == PLAYER else "Yellow's turn"
                     show_message(screen, who, ai_depth, mode, first)
 
-        # AI move (only in PvE)
+        # --------------------------
+        # AI move (only in PvE) with smart tactics
+        # --------------------------
         if not game_over and mode == "PvE" and turn == AI:
-            target_ms = 150 + 110 * ai_depth
-            start = pygame.time.get_ticks()
-            col, _ = minimax(board, ai_depth, -math.inf, math.inf, True)
-            compute_ms = pygame.time.get_ticks() - start
-            wait_ms = max(0, target_ms - compute_ms)
-            if wait_ms > 0:
-                pygame.time.wait(wait_ms)
+            # 1) take instant win
+            wins = immediate_wins(board, AI_PIECE)
+            if wins:
+                col = max(wins, key=lambda c: -abs(c - COLUMN_COUNT//2))
+            else:
+                # 2) block player's instant win
+                opp_wins = immediate_wins(board, PLAYER_PIECE)
+                if opp_wins:
+                    col = max(opp_wins, key=lambda c: -abs(c - COLUMN_COUNT//2))
+                else:
+                    # 3) prefer safe moves that don't allow immediate reply win
+                    valids = get_valid_locations(board)
+                    safe_moves = [c for c in valids if not is_unsafe_for_ai(board, c)]
+                    candidate_moves = safe_moves if safe_moves else valids
+
+                    # 4) strong search with ordering + cache
+                    target_ms = 150 + 110 * ai_depth
+                    start = pygame.time.get_ticks()
+                    # Try best-ordered candidate as a hint before full minimax (move ordering)
+                    ordered = sorted(candidate_moves,
+                                     key=lambda c: score_position(simulate_drop(board, c, AI_PIECE)[1], AI_PIECE) if simulate_drop(board, c, AI_PIECE)[1] is not None else -10_000,
+                                     reverse=True)
+                    # kick alpha-beta from the (likely) best
+                    col_guess = ordered[0] if ordered else None
+                    # full minimax from position
+                    col_mm, _ = minimax(board, ai_depth, -math.inf, math.inf, True)
+                    col = col_mm if col_mm is not None else (col_guess if col_guess is not None else (ordered_valid := get_valid_locations(board))[0])
+
+                    compute_ms = pygame.time.get_ticks() - start
+                    wait_ms = max(0, target_ms - compute_ms)
+                    if wait_ms > 0:
+                        pygame.time.wait(wait_ms)
 
             if col is None:
                 show_message(screen, "Draw!", ai_depth, mode, first)
