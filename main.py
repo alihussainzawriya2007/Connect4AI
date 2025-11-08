@@ -25,6 +25,16 @@ except Exception:
     Document = None
     HAS_DOCX = False
 
+# Optional JIT (auto if installed)
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except Exception:
+    HAS_NUMBA = False
+    njit = None
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 # --------------------------
 # Config & Constants
 # --------------------------
@@ -51,9 +61,13 @@ SLIDER_MIN = 1
 SLIDER_MAX = 9
 SLIDER_W   = 220
 
-WIN_SCORE = 10_000_000
-LOSE_SCORE= -10_000_000
-DRAW_SCORE= 0
+WIN_SCORE  = 10_000_000
+LOSE_SCORE = -10_000_000
+DRAW_SCORE = 0
+
+# Parallelization
+USE_PARALLEL_ROOT = True
+MAX_WORKERS = max(2, (os.cpu_count() or 4) // 2)  # gentle default
 
 # UI
 SQUARESIZE = 100
@@ -88,9 +102,9 @@ def print_board(board: np.ndarray) -> None:
     print(np.flip(board, 0))
 
 # --------------------------
-# Game state checks
+# Game state checks (Python)
 # --------------------------
-def winning_move(board: np.ndarray, piece: int) -> bool:
+def winning_move_py(board: np.ndarray, piece: int) -> bool:
     # Horizontal
     for c in range(COLUMN_COUNT - 3):
         for r in range(ROW_COUNT):
@@ -117,169 +131,246 @@ def winning_move(board: np.ndarray, piece: int) -> bool:
                 return True
     return False
 
+def evaluate_window_py(window: List[int], piece: int) -> int:
+    score = 0
+    opp = PLAYER_PIECE if piece == AI_PIECE else AI_PIECE
+    if window.count(piece) == 4: score += 100
+    elif window.count(piece) == 3 and window.count(EMPTY) == 1: score += 5
+    elif window.count(piece) == 2 and window.count(EMPTY) == 2: score += 2
+    if window.count(opp) == 3 and window.count(EMPTY) == 1: score -= 4
+    return score
+
+def score_position_py(board: np.ndarray, piece: int) -> int:
+    score = 0
+    center_array = [int(i) for i in list(board[:, COLUMN_COUNT // 2])]
+    score += center_array.count(piece) * 3
+    for r in range(ROW_COUNT):
+        row_array = [int(i) for i in list(board[r, :])]
+        for c in range(COLUMN_COUNT - 3):
+            score += evaluate_window_py(row_array[c:c+WINDOW_LENGTH], piece)
+    for c in range(COLUMN_COUNT):
+        col_array = [int(i) for i in list(board[:, c])]
+        for r in range(ROW_COUNT - 3):
+            score += evaluate_window_py(col_array[r:r+WINDOW_LENGTH], piece)
+    for r in range(ROW_COUNT - 3):
+        for c in range(COLUMN_COUNT - 3):
+            score += evaluate_window_py([int(board[r+i, c+i]) for i in range(WINDOW_LENGTH)], piece)
+    for r in range(ROW_COUNT - 3):
+        for c in range(COLUMN_COUNT - 3):
+            score += evaluate_window_py([int(board[r+3-i, c+i]) for i in range(WINDOW_LENGTH)], piece)
+    return score
+
+# --------------------------
+# Optional JIT versions
+# --------------------------
+if HAS_NUMBA:
+    @njit(cache=True)
+    def winning_move_njit(board: np.ndarray, piece: int) -> bool:
+        rows, cols = board.shape
+        # Horizontal
+        for c in range(cols - 3):
+            for r in range(rows):
+                if (board[r, c] == piece and board[r, c+1] == piece
+                    and board[r, c+2] == piece and board[r, c+3] == piece):
+                    return True
+        # Vertical
+        for c in range(cols):
+            for r in range(rows - 3):
+                if (board[r, c] == piece and board[r+1, c] == piece
+                    and board[r+2, c] == piece and board[r+3, c] == piece):
+                    return True
+        # Diagonal \
+        for c in range(cols - 3):
+            for r in range(rows - 3):
+                if (board[r, c] == piece and board[r+1, c+1] == piece
+                    and board[r+2, c+2] == piece and board[r+3, c+3] == piece):
+                    return True
+        # Diagonal /
+        for c in range(cols - 3):
+            for r in range(3, rows):
+                if (board[r, c] == piece and board[r-1, c+1] == piece
+                    and board[r-2, c+2] == piece and board[r-3, c+3] == piece):
+                    return True
+        return False
+
+    @njit(cache=True)
+    def score_position_njit(board: np.ndarray, piece: int) -> int:
+        rows, cols = board.shape
+        score = 0
+        center_col = cols // 2
+        # center
+        cnt = 0
+        for i in range(rows):
+            if board[i, center_col] == piece:
+                cnt += 1
+        score += 3 * cnt
+
+        # rows
+        for r in range(rows):
+            for c in range(cols - 3):
+                w0 = board[r, c]
+                w1 = board[r, c+1]
+                w2 = board[r, c+2]
+                w3 = board[r, c+3]
+                score += _eval_window_njit(w0, w1, w2, w3, piece)
+        # cols
+        for c in range(cols):
+            for r in range(rows - 3):
+                w0 = board[r, c]
+                w1 = board[r+1, c]
+                w2 = board[r+2, c]
+                w3 = board[r+3, c]
+                score += _eval_window_njit(w0, w1, w2, w3, piece)
+        # diag \
+        for r in range(rows - 3):
+            for c in range(cols - 3):
+                w0 = board[r, c]
+                w1 = board[r+1, c+1]
+                w2 = board[r+2, c+2]
+                w3 = board[r+3, c+3]
+                score += _eval_window_njit(w0, w1, w2, w3, piece)
+        # diag /
+        for r in range(rows - 3):
+            for c in range(cols - 3):
+                w0 = board[r+3, c]
+                w1 = board[r+2, c+1]
+                w2 = board[r+1, c+2]
+                w3 = board[r,   c+3]
+                score += _eval_window_njit(w0, w1, w2, w3, piece)
+        return score
+
+    @njit(cache=True)
+    def _eval_window_njit(a, b, c, d, piece) -> int:
+        score = 0
+        opp = 1 if piece == 2 else 2
+        cnt_p = int(a == piece) + int(b == piece) + int(c == piece) + int(d == piece)
+        cnt_e = int(a == 0) + int(b == 0) + int(c == 0) + int(d == 0)
+        cnt_o = int(a == opp)  + int(b == opp)  + int(c == opp)  + int(d == opp)
+        if cnt_p == 4: score += 100
+        elif cnt_p == 3 and cnt_e == 1: score += 5
+        elif cnt_p == 2 and cnt_e == 2: score += 2
+        if cnt_o == 3 and cnt_e == 1: score -= 4
+        return score
+
+# Bind function pointers (JIT if available)
+WIN_CHECK   = winning_move_njit   if HAS_NUMBA else winning_move_py
+SCORE_FUNC  = score_position_njit if HAS_NUMBA else score_position_py
+
+def winning_move(board: np.ndarray, piece: int) -> bool:
+    # wrapper to keep bool type consistent across njit/py
+    return bool(WIN_CHECK(board, piece))
+
+def score_position(board: np.ndarray, piece: int) -> int:
+    return int(SCORE_FUNC(board, piece))
+
 def is_terminal_node(board: np.ndarray) -> bool:
     return winning_move(board, PLAYER_PIECE) or winning_move(board, AI_PIECE) or len(get_valid_locations(board)) == 0
 
 # --------------------------
-# Heuristic scoring
+# Minimax (with ordering)
 # --------------------------
-def evaluate_window(window: List[int], piece: int) -> int:
-    score = 0
-    opp = PLAYER_PIECE if piece == AI_PIECE else AI_PIECE
-    if window.count(piece) == 4:
-        score += 100
-    elif window.count(piece) == 3 and window.count(EMPTY) == 1:
-        score += 7           # a bit stronger than before
-    elif window.count(piece) == 2 and window.count(EMPTY) == 2:
-        score += 2
-    # punish letting opponent make a 3
-    if window.count(opp) == 3 and window.count(EMPTY) == 1:
-        score -= 8           # stronger block incentive
-    return score
+def ordered_valid_locations(board: np.ndarray) -> List[int]:
+    # prefer center
+    order = [3,2,4,1,5,0,6]
+    return [c for c in order if is_valid_location(board, c)]
 
-def score_position(board: np.ndarray, piece: int) -> int:
-    score = 0
-    # center control: weight center column a bit more
-    center_array = [int(i) for i in list(board[:, COLUMN_COUNT // 2])]
-    score += center_array.count(piece) * 4
-
-    # rows
-    for r in range(ROW_COUNT):
-        row_array = [int(i) for i in list(board[r, :])]
-        for c in range(COLUMN_COUNT - 3):
-            score += evaluate_window(row_array[c:c+WINDOW_LENGTH], piece)
-
-    # cols
-    for c in range(COLUMN_COUNT):
-        col_array = [int(i) for i in list(board[:, c])]
-        for r in range(ROW_COUNT - 3):
-            score += evaluate_window(col_array[r:r+WINDOW_LENGTH], piece)
-
-    # positive diagonals
-    for r in range(ROW_COUNT - 3):
-        for c in range(COLUMN_COUNT - 3):
-            score += evaluate_window([int(board[r+i, c+i]) for i in range(WINDOW_LENGTH)], piece)
-
-    # negative diagonals
-    for r in range(ROW_COUNT - 3):
-        for c in range(COLUMN_COUNT - 3):
-            score += evaluate_window([int(board[r+3-i, c+i]) for i in range(WINDOW_LENGTH)], piece)
-    return score
-
-# --------------------------
-# AI helpers: tactics + ordering + safety
-# --------------------------
-def simulate_drop(board: np.ndarray, col: int, piece: int):
-    """Return (row, board_copy) after dropping piece; or (None, None) if invalid."""
-    if not is_valid_location(board, col):
-        return None, None
-    row = get_next_open_row(board, col)
-    if row is None:
-        return None, None
-    b_copy = board.copy()
-    drop_piece(b_copy, row, col, piece)
-    return row, b_copy
-
-def immediate_wins(board: np.ndarray, piece: int) -> List[int]:
-    wins = []
-    for col in get_valid_locations(board):
-        row, b2 = simulate_drop(board, col, piece)
-        if b2 is not None and winning_move(b2, piece):
-            wins.append(col)
-    return wins
-
-def is_unsafe_for_ai(board: np.ndarray, col: int) -> bool:
-    """True if after AI plays at col, the player gets an immediate winning reply."""
-    row, b2 = simulate_drop(board, col, AI_PIECE)
-    if b2 is None:
-        return True
-    # if AI already wins, it's fine (not unsafe)
-    if winning_move(b2, AI_PIECE):
-        return False
-    # can player win next move?
-    return any(winning_move(simulate_drop(b2, oc, PLAYER_PIECE)[1], PLAYER_PIECE)
-               for oc in get_valid_locations(b2))
-
-def order_moves(board: np.ndarray, maximizing: bool) -> List[int]:
-    """Sort moves by heuristic lookahead + center preference for strong pruning."""
-    valid = get_valid_locations(board)
-    center = COLUMN_COUNT // 2
-    scored = []
-    if maximizing:
-        for col in valid:
-            _, b2 = simulate_drop(board, col, AI_PIECE)
-            if b2 is None: 
-                continue
-            s = score_position(b2, AI_PIECE)
-            # small center bias
-            s += (3 - abs(col - center))
-            scored.append((s, col))
-        scored.sort(reverse=True)  # best first
-    else:
-        # minimizing: prefer moves that are worst for AI (best for player)
-        for col in valid:
-            _, b2 = simulate_drop(board, col, PLAYER_PIECE)
-            if b2 is None: 
-                continue
-            s = score_position(b2, AI_PIECE)
-            s += (3 - abs(col - center))
-            scored.append((s, col))
-        scored.sort()  # worst for AI first
-    return [c for _, c in scored]
-
-# Transposition table (simple exact caching)
-TRANSPOS: dict = {}
-
-# --------------------------
-# Minimax (with improved ordering + cache)
-# --------------------------
 def minimax(board: np.ndarray, depth: int, alpha: float, beta: float, maximizing: bool) -> Tuple[Optional[int], int]:
-    key = (board.tobytes(), depth, maximizing)
-    if key in TRANSPOS:
-        return TRANSPOS[key]
-
+    valid_locations = ordered_valid_locations(board)
     terminal = is_terminal_node(board)
     if depth == 0 or terminal:
         if terminal:
-            if winning_move(board, AI_PIECE):       val = WIN_SCORE
-            elif winning_move(board, PLAYER_PIECE): val = LOSE_SCORE
-            else:                                    val = DRAW_SCORE
-            TRANSPOS[key] = (None, val)
-            return TRANSPOS[key]
-        val = score_position(board, AI_PIECE)
-        TRANSPOS[key] = (None, val)
-        return TRANSPOS[key]
+            if winning_move(board, AI_PIECE):       return None, WIN_SCORE
+            elif winning_move(board, PLAYER_PIECE): return None, LOSE_SCORE
+            else:                                   return None, DRAW_SCORE
+        return None, score_position(board, AI_PIECE)
 
-    best_col = None
+    best_col = valid_locations[0] if valid_locations else None
     if maximizing:
         value = -math.inf
-        for col in order_moves(board, True):
-            row, b2 = simulate_drop(board, col, AI_PIECE)
-            if b2 is None: 
-                continue
-            _, new_score = minimax(b2, depth-1, alpha, beta, False)
+        for col in valid_locations:
+            row = get_next_open_row(board, col)
+            if row is None: continue
+            b_copy = board.copy()
+            drop_piece(b_copy, row, col, AI_PIECE)
+            _, new_score = minimax(b_copy, depth-1, alpha, beta, False)
             if new_score > value:
                 value, best_col = new_score, col
             alpha = max(alpha, value)
-            if alpha >= beta:
-                break
-        result = (best_col, int(value))
+            if alpha >= beta: break
+        return best_col, int(value)
     else:
         value = math.inf
-        for col in order_moves(board, False):
-            row, b2 = simulate_drop(board, col, PLAYER_PIECE)
-            if b2 is None: 
-                continue
-            _, new_score = minimax(b2, depth-1, alpha, beta, True)
+        for col in valid_locations:
+            row = get_next_open_row(board, col)
+            if row is None: continue
+            b_copy = board.copy()
+            drop_piece(b_copy, row, col, PLAYER_PIECE)
+            _, new_score = minimax(b_copy, depth-1, alpha, beta, True)
             if new_score < value:
                 value, best_col = new_score, col
             beta = min(beta, value)
-            if alpha >= beta:
-                break
-        result = (best_col, int(value))
+            if alpha >= beta: break
+        return best_col, int(value)
 
-    TRANSPOS[key] = result
-    return result
+# ---------- Root parallelization ----------
+def _minimax_child(board: np.ndarray, col: int, depth: int) -> Tuple[int, int]:
+    """Evaluate one child move for AI root (maximizing)."""
+    row = get_next_open_row(board, col)
+    if row is None:
+        return col, -10**9
+    b_copy = board.copy()
+    drop_piece(b_copy, row, col, AI_PIECE)
+    _, sc = minimax(b_copy, depth-1, -math.inf, math.inf, False)
+    return col, sc
+
+def minimax_root_parallel(board: np.ndarray, depth: int, maximizing: bool, candidate_moves: List[int]) -> Tuple[Optional[int], int]:
+    if not candidate_moves:
+        return None, 0
+    if not USE_PARALLEL_ROOT or len(candidate_moves) == 1 or depth <= 2:
+        # sequential fallback
+        best_col, best_score = None, -math.inf
+        for c in candidate_moves:
+            col, sc = _minimax_child(board, c, depth)
+            # center tie-break
+            key = (sc, -abs(c - COLUMN_COUNT//2))
+            if best_col is None or key > (best_score, -abs(best_col - COLUMN_COUNT//2)):
+                best_col, best_score = col, sc
+        return best_col, int(best_score)
+
+    best_col, best_score = None, -math.inf
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidate_moves))) as ex:
+        futures = {ex.submit(_minimax_child, board, c, depth): c for c in candidate_moves}
+        for fut in as_completed(futures):
+            col, sc = fut.result()
+            key = (sc, -abs(col - COLUMN_COUNT//2))
+            if best_col is None or key > (best_score, -abs(best_col - COLUMN_COUNT//2)):
+                best_col, best_score = col, sc
+    return best_col, int(best_score)
+
+# --------------------------
+# Tactical helpers to make AI smarter
+# --------------------------
+def immediate_wins(board: np.ndarray, piece: int) -> List[int]:
+    cols = []
+    for c in get_valid_locations(board):
+        r = get_next_open_row(board, c)
+        if r is None: 
+            continue
+        b2 = board.copy()
+        drop_piece(b2, r, c, piece)
+        if winning_move(b2, piece):
+            cols.append(c)
+    return cols
+
+def is_unsafe_for_ai(board: np.ndarray, ai_col: int) -> bool:
+    """After AI plays ai_col, can the human win immediately next turn?"""
+    r = get_next_open_row(board, ai_col)
+    if r is None:
+        return True
+    b2 = board.copy()
+    drop_piece(b2, r, ai_col, AI_PIECE)
+    # human immediate wins now?
+    return len(immediate_wins(b2, PLAYER_PIECE)) > 0
 
 # --------------------------
 # Drawing helpers (centers, slider, glow, controls)
@@ -332,7 +423,7 @@ def draw_slider(surface: pygame.Surface, ai_depth: int, active: bool = True):
     pygame.draw.rect(surface, (60,60,60) if active else (40,40,40), track, border_radius=4)
     fill = pygame.Rect(track.left, track.top, max(0, hx - track.left), track.height)
     pygame.draw.rect(surface, (200,200,200) if active else (90,90,90), fill, border_radius=4)
-    # handle (fixed signatures)
+    # handle
     handle_col = WHITE if active else GREY
     if HAS_GFX:
         gfx.filled_circle(surface, hx, hy, hr, handle_col)
@@ -510,6 +601,27 @@ def save_game_result(board: np.ndarray, result: str, docx_path: str = "Connect4_
     print(f"[INFO] Saved board to {docx_path}")
 
 # --------------------------
+# Best-move chooser (no artificial delay)
+# --------------------------
+def choose_best_ai_move(board: np.ndarray, depth: int) -> int:
+    # 1) Win immediately if possible
+    wins = immediate_wins(board, AI_PIECE)
+    if wins:
+        # prefer closer to center among winning moves
+        return max(wins, key=lambda c: -abs(c - COLUMN_COUNT//2))
+    # 2) Block opponent's immediate win
+    opp_wins = immediate_wins(board, PLAYER_PIECE)
+    if opp_wins:
+        return max(opp_wins, key=lambda c: -abs(c - COLUMN_COUNT//2))
+    # 3) Avoid obvious blunders (opponent wins next)
+    valids = get_valid_locations(board)
+    safe = [c for c in valids if not is_unsafe_for_ai(board, c)]
+    candidate_moves = safe if safe else valids
+    # 4) Parallelized root minimax over candidates
+    col, _ = minimax_root_parallel(board, depth, True, candidate_moves)
+    return col if col is not None else candidate_moves[0]
+
+# --------------------------
 # Game loop
 # --------------------------
 def main() -> None:
@@ -531,7 +643,7 @@ def main() -> None:
     turn = (AI if (mode == "PvE" and first == "AI") else PLAYER)
     game_over = False
 
-    # initialize hover to actual mouse x so first click works even without moving
+    # initialize hover to actual mouse x so first click is correct
     hover_x = pygame.mouse.get_pos()[0]
 
     draw_board(screen, board, last_user, last_bot,
@@ -549,9 +661,7 @@ def main() -> None:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     pygame.quit(); sys.exit()
                 if event.key == pygame.K_r:
-                    # reset everything, also clear TT to avoid stale caches
                     board[:] = 0
-                    TRANSPOS.clear()
                     last_user = last_bot = None
                     game_over = False
                     turn = (AI if (mode == "PvE" and first == "AI") else PLAYER)
@@ -566,13 +676,17 @@ def main() -> None:
                     # Buttons
                     mode_rect, first_rect = get_control_rects()
                     if mode_rect.collidepoint(mx, my):
+                        # Toggle mode
                         mode = "PvP" if mode == "PvE" else "PvE"
+                        # Reset game with new mode
                         board[:] = 0
-                        TRANSPOS.clear()
                         last_user = last_bot = None
                         game_over = False
-                        turn = (AI if (mode == "PvE" and first == "AI") else PLAYER)
-                        if mode == "PvP":
+                        if mode == "PvE":
+                            # keep 'first' as-is; decide who starts
+                            turn = (AI if first == "AI" else PLAYER)
+                        else:
+                            # PvP: red always first
                             turn = PLAYER
                         draw_board(screen, board, last_user, last_bot,
                                    "New game! Your turn" if turn == PLAYER else ("AI thinking…" if mode == "PvE" else "Yellow's turn"),
@@ -580,8 +694,8 @@ def main() -> None:
                         continue
                     if first_rect.collidepoint(mx, my) and mode == "PvE":
                         first = "AI" if first == "Human" else "Human"
+                        # Restart to apply who starts
                         board[:] = 0
-                        TRANSPOS.clear()
                         last_user = last_bot = None
                         game_over = False
                         turn = (AI if first == "AI" else PLAYER)
@@ -592,10 +706,9 @@ def main() -> None:
 
                     # Slider
                     track, (hx, hy), hr = slider_rects(ai_depth)
-                    if mode == "PvE" and (track.inflate(20, 16).collidepoint(mx, my) or (mx - hx)*2 + (my - hy)2 <= (hr+6)*2):
+                    if mode == "PvE" and (track.inflate(20, 16).collidepoint(mx, my) or (mx - hx)**2 + (my - hy)**2 <= (hr+6)**2):
                         slider_drag = True
                         ai_depth = x_to_depth(mx, track)
-                        TRANSPOS.clear()  # new depth -> clear cache
                         draw_board(screen, board, last_user, last_bot, "Depth changed", ai_depth, mode, first)
                         continue  # don't treat as board click
 
@@ -631,6 +744,7 @@ def main() -> None:
                 if my < TOPBAR_H:
                     continue  # click on top bar
 
+                # choose column from the actual click X (not hover_x)
                 col = mx // SQUARESIZE
 
                 if not is_valid_location(board, col):
@@ -683,10 +797,12 @@ def main() -> None:
 
                 # Next turn
                 if mode == "PvE":
+                    # human -> AI
                     if turn == PLAYER:
                         turn = AI
                         show_message(screen, "AI thinking…", ai_depth, mode, first)
                     else:
+                        # shouldn't happen; AI handled below
                         turn = PLAYER
                         show_message(screen, "Your turn", ai_depth, mode, first)
                 else:
@@ -695,42 +811,9 @@ def main() -> None:
                     who = "Red's turn" if turn == PLAYER else "Yellow's turn"
                     show_message(screen, who, ai_depth, mode, first)
 
-        # --------------------------
-        # AI move (only in PvE) with smart tactics
-        # --------------------------
+        # AI move (only in PvE) — NO artificial delays
         if not game_over and mode == "PvE" and turn == AI:
-            # 1) take instant win
-            wins = immediate_wins(board, AI_PIECE)
-            if wins:
-                col = max(wins, key=lambda c: -abs(c - COLUMN_COUNT//2))
-            else:
-                # 2) block player's instant win
-                opp_wins = immediate_wins(board, PLAYER_PIECE)
-                if opp_wins:
-                    col = max(opp_wins, key=lambda c: -abs(c - COLUMN_COUNT//2))
-                else:
-                    # 3) prefer safe moves that don't allow immediate reply win
-                    valids = get_valid_locations(board)
-                    safe_moves = [c for c in valids if not is_unsafe_for_ai(board, c)]
-                    candidate_moves = safe_moves if safe_moves else valids
-
-                    # 4) strong search with ordering + cache
-                    target_ms = 150 + 110 * ai_depth
-                    start = pygame.time.get_ticks()
-                    # Try best-ordered candidate as a hint before full minimax (move ordering)
-                    ordered = sorted(candidate_moves,
-                                     key=lambda c: score_position(simulate_drop(board, c, AI_PIECE)[1], AI_PIECE) if simulate_drop(board, c, AI_PIECE)[1] is not None else -10_000,
-                                     reverse=True)
-                    # kick alpha-beta from the (likely) best
-                    col_guess = ordered[0] if ordered else None
-                    # full minimax from position
-                    col_mm, _ = minimax(board, ai_depth, -math.inf, math.inf, True)
-                    col = col_mm if col_mm is not None else (col_guess if col_guess is not None else (ordered_valid := get_valid_locations(board))[0])
-
-                    compute_ms = pygame.time.get_ticks() - start
-                    wait_ms = max(0, target_ms - compute_ms)
-                    if wait_ms > 0:
-                        pygame.time.wait(wait_ms)
+            col = choose_best_ai_move(board, ai_depth)
 
             if col is None:
                 show_message(screen, "Draw!", ai_depth, mode, first)
@@ -757,5 +840,5 @@ def main() -> None:
                         turn = PLAYER
                         show_message(screen, "Your turn", ai_depth, mode, first)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
